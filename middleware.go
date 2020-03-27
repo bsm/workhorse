@@ -2,14 +2,13 @@ package workhorse
 
 import (
 	"context"
-	"errors"
 	"time"
 )
 
 // Every applies a task periodically every interval until the first
 // failure. Example:
 //
-// 	w.Run(workhorse.Every(func(ctx context.Context) error {
+// 	w.Go("task", workhorse.Every(func(ctx context.Context) error {
 // 		fmt.Println("still alive!")
 // 		return nil
 // 	}, time.Minute))
@@ -21,7 +20,7 @@ func Every(task Task, interval time.Duration) Task {
 		for {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil
 			case <-t.C:
 			}
 
@@ -32,25 +31,46 @@ func Every(task Task, interval time.Duration) Task {
 	}
 }
 
-// Bypass ignores certain errors.
-// Uses errors.Is to make the comparison
+// Retry retries a task on failures with a linear backoff.
+// Set the numRetries to -1 to retry forever. Example:
 //
-// 	w.Run(workhorse.Bypass(func(ctx context.Context) error {
-// 		select {
-// 		case <-ctx.Done()
-// 			return ctx.Err() // will be ignored
-// 		case <-time.After(time.Hour)
-// 			return nil
-// 		}
-// 	}, context.Canceled, io.EOF))
-func Bypass(task Task, ignore ...error) Task {
+// 	w.Go("task", workhorse.Retry(func(ctx context.Context) error {
+// 		return fmt.Errorf("instant failure!")
+// 	}, 4, time.Second))
+func Retry(task Task, numRetries int, backoff time.Duration) Task {
 	return func(ctx context.Context) error {
-		err := task(ctx)
-		for _, irr := range ignore {
-			if errors.Is(err, irr) {
+		t := time.NewTimer(backoff)
+		defer t.Stop()
+
+		remaining := numRetries
+		for {
+			err := task(ctx)
+			if err == nil {
 				return nil
+			} else if remaining == 0 {
+				return err
+			} else if remaining > 0 {
+				remaining--
+			}
+
+			t.Reset(backoff)
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-t.C:
 			}
 		}
+	}
+}
+
+// Instrument allows to instrument tasks.
+func Instrument(task Task, tfn func(name string, runTime time.Duration, err error)) Task {
+	return func(ctx context.Context) error {
+		start := time.Now()
+		err := task(ctx)
+		elapsed := time.Since(start)
+		tfn(TaskName(ctx), elapsed, err)
 		return err
 	}
 }
